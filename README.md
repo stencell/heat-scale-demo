@@ -1,12 +1,15 @@
 # heat-scale-demo
 Demo to show how heat can provide scaling URLs to allow for external app to control up/down scaling.
 
-- Edit the environment file:
-- vi heat-scale-demo/hpc.env  - ensure the values here will work in your environment
-- Build the cluster:
+Edit the environment file:
+
+vi heat-scale-demo/hpc.env  - ensure the values here will work in your environment
+
+Build the cluster:
+
 heat stack-create hpc-demo -e heat-scale-demo/hpc.env -f heat-scale-demo/build-cluster.yaml 
 
-- Get the scaling handles:
+Get the scaling handles:
  
  heat output-show br1 scale_down_url
 
