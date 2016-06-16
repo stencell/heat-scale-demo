@@ -1,0 +1,368 @@
+heat_template_version: 2014-10-16
+
+
+description: >
+  Deploy a head server and a scalable number of HPC worker nodes
+
+
+parameters:
+
+  # Access to the VMs
+  ssh_user:
+    type: string
+    description: >
+      The SSH user available on all nodes.
+    default: 'cloud-user'
+
+  ssh_key_name:
+    type: string
+    description: Name of the SSH keypair registered with Nova
+    constraints:
+    - custom_constraint: nova.keypair
+    default: 'test-key'
+
+  # VM characteristics
+  server_image:
+    type: string
+    description: Name or ID of the host image registered with Glance
+    constraints:
+    - custom_constraint: glance.image
+    default: 'rhel72'
+
+  flavor:
+    type: string
+    description: The Nova flavor to use for the nodes
+    default: m1.medium
+    constraints:
+    - custom_constraint: nova.flavor
+    default: 'm1.small'
+
+  timeout:
+    description: Time to wait until the setup is ready.
+    type: number
+    default: 600
+
+  # Networks to connect to or create
+  external_network:
+    type: string
+    description: >
+      The external network that provides floating IP addresses for the nodes
+    constraints:
+    - custom_constraint: neutron.network
+    default: 'public'
+
+  internal_subnet:
+    type: string
+    description: >
+      The subnet used for node-node and node-master communication
+    default: 192.168.0.0/24
+
+  dns_nameserver:
+    type: comma_delimited_list
+    description: address of a dns nameserver reachable in your environment
+    default: 8.8.8.8
+
+  head_hostname:
+    type: string
+    description: >
+      The hostname that is going to be set for the dedicated head node.
+    default: 'head'
+
+  worker_node_hostname:
+    type: string
+    description: >
+      The hostname that is going to be set for the worker nodes.
+    default: 'worker'
+
+
+  # Node scaling parameters
+  autoscaling:
+    type: boolean
+    description: >
+      Automatically scale up/down worker nodes.
+    default: true
+
+
+  worker_node_count:
+    type: number
+    description: >
+      Number of worker nodes to create.
+    default: 1
+
+  worker_nodes_min:
+    type: number
+    description: >
+      Minimum number of worker nodes if autoscaling is enabled.
+    default: 1
+
+  worker_nodes_max:
+    type: number
+    description: >
+      Maximum number of worker nodes if autoscaling is enabled.
+    default: 5
+
+  # Internal and Auxiliary Services
+
+
+  # Red Hat subscription parameters
+  rhn_username:
+    type: string
+    description: >
+      The username for registering the hosts with RHN. If empty, they will not
+      be registered.
+    default: ''
+
+  rhn_password:
+    type: string
+    description: >
+      The password for registering the hosts with RHN. If empty, they will not
+      be registered.
+    hidden: true
+    default: ''
+
+  rhn_pool:
+    type: string
+    description: >
+      The pool to attach. Will use `subscription-manager attach --auto` if left
+      blank.
+    hidden: true
+    default: ''
+
+
+resources:
+
+  # Network Components
+  fixed_network:
+    type: OS::Neutron::Net
+
+  fixed_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      cidr: {get_param: internal_subnet}
+      network: {get_resource: fixed_network}
+      dns_nameservers: {get_param: dns_nameserver}
+
+  external_router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: {get_param: external_network}
+
+  external_router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: {get_resource: external_router}
+      subnet: {get_resource: fixed_subnet}
+
+  # Head node
+  head_node:
+    depends_on: external_router_interface
+    type: OS::Nova::Server
+    properties:
+      image: {get_param: server_image}
+      flavor: {get_param: flavor}
+      key_name: {get_param: ssh_key_name}
+      admin_user: {get_param: ssh_user}
+      networks:
+      - port: {get_resource: head_port}
+      name:
+        str_replace:
+          template: "%stackname%-%hostname%"
+          params:
+            '%stackname%': {get_param: 'OS::stack_name'}
+            '%hostname%': {get_param: head_hostname}
+      user_data_format: SOFTWARE_CONFIG
+      user_data: {get_resource: head_init}
+
+  head_init:
+    type: OS::Heat::MultipartMime
+    properties:
+      parts:
+      - config: {get_resource: rhn_register}
+      - config: {get_resource: host_update}
+      #- config: {get_attr: [config_agent, config]}
+      #  type: multipart
+      - config: {get_resource: head_node_boot}
+
+  head_node_boot:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      config:
+        str_replace:
+          params:
+            $WC_NOTIFY: { get_attr: ['wait_handle', 'curl_cli'] }
+          template: |
+            #!/bin/bash
+            set -eu
+            set -x
+            set -o pipefail
+            function notify_success() {
+              $WC_NOTIFY --data-binary  "{\"status\": \"SUCCESS\", \"reason\": \"$1\", \"data\": \"$1\"}"
+              exit 0
+            }
+            function notify_failure() {
+              $WC_NOTIFY --data-binary "{\"status\": \"FAILURE\", \"reason\": \"$1\", \"data\": \"$1\"}"
+              exit 1
+            }
+            # Required for SSH pipelining
+            sed -i "s/^.*requiretty/#Defaults requiretty/" /etc/sudoers
+            notify_success "head node has been prepared for running HPC."
+
+  head_port:
+    type: OS::Neutron::Port
+    properties:
+      security_groups:
+      - {get_resource: head_security_group}
+      network: {get_resource: fixed_network}
+      fixed_ips:
+      - subnet: {get_resource: fixed_subnet}
+      replacement_policy: AUTO
+
+  head_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      rules:
+      - protocol: icmp
+      - protocol: tcp
+        port_range_min: 22
+        port_range_max: 22
+
+  head_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: {get_param: external_network}
+      port_id: {get_resource: head_port}
+
+  # Worker VM
+  worker_nodes:
+    depends_on: external_router_interface
+    type: OS::Heat::AutoScalingGroup
+    properties:
+      desired_capacity: {get_param: worker_node_count}
+      min_size: {get_param: worker_nodes_min}
+      max_size: {get_param: worker_nodes_max}
+      resource:
+        type: worker.yaml
+        properties:
+          image: {get_param: server_image}
+          flavor: {get_param: flavor}
+          key_name: {get_param: ssh_key_name}
+          ssh_user: {get_param: ssh_user}
+          fixed_network: {get_resource: fixed_network}
+          fixed_subnet: {get_resource: fixed_subnet}
+          rhn_username: {get_param: rhn_username}
+          rhn_password: {get_param: rhn_password}
+          rhn_pool: {get_param: rhn_pool}
+          timeout: {get_param: timeout}
+          hostname:
+            str_replace:
+              template: "%stackname%-%hostname%"
+              params:
+                '%stackname%': {get_param: 'OS::stack_name'}
+                '%hostname%': {get_param: worker_node_hostname}
+
+  # Scaling and Operational Controls
+  scale_up_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: worker_nodes}
+      cooldown: 60
+      scaling_adjustment: 1
+
+  scale_down_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: worker_nodes}
+      cooldown: 60
+      scaling_adjustment: '-1'
+
+  #shared resources
+  rhn_register:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      config:
+        str_replace:
+          params:
+            $RHN_USERNAME: {get_param: rhn_username}
+            $RHN_PASSWORD: {get_param: rhn_password}
+            $POOL_ID: {get_param: rhn_pool}
+          template: |
+            #!/bin/bash
+            set -eu
+            set -x
+            set -o pipefail
+            if [ -n "$RHN_USERNAME" -a -n "$RHN_PASSWORD" ]; then
+              subscription-manager register \
+                         --username="$RHN_USERNAME" \
+                         --password="$RHN_PASSWORD"
+              if [ -n "$POOL_ID" ]; then
+                subscription-manager attach --pool $POOL_ID
+              else
+                subscription-manager attach --auto
+              fi
+              subscription-manager repos --disable="*"
+              subscription-manager repos \
+                         --enable="rhel-7-server-rpms"
+              rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+            fi
+
+  host_update:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      config:
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -eux
+            set -o pipefail
+            function notify_success() {
+              $WC_NOTIFY --data-binary  "{\"status\": \"SUCCESS\", \"reason\": \"$1\", \"data\": \"$1\"}"
+              exit 0
+            }
+            function notify_failure() {
+              $WC_NOTIFY --data-binary "{\"status\": \"FAILURE\", \"reason\": \"$1\", \"data\": \"$1\"}"
+              exit 1
+            }
+            if [ -e /run/ostree-booted ]; then
+              atomic host upgrade || notify_failure "failed to run 'atomic host upgrade'"
+            else
+              yum install -y deltarpm || notify_failure "could not install deltarpm"
+              yum -y update || notify_failure "could not update RPMs"
+            fi
+          params:
+            $WC_NOTIFY: {get_attr: ['wait_handle', 'curl_cli'] }
+
+  wait_condition:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: {get_resource: wait_handle}
+      timeout: {get_param: timeout}
+
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+
+outputs:
+  head_ip:
+    description: IP address of the head server
+    value: {get_attr: [head_floating_ip, floating_ip_address]}
+
+  worker_ips:
+    description: IP addresses of the worker nodes
+    value: {get_attr: [worker_nodes, outputs_list, ip_address]}
+
+  scale_up_url:
+    description: >
+      This URL is the webhook to scale up the autoscaling group.  You
+      can invoke the scale-up operation by doing an HTTP POST to this
+      URL; no body nor extra headers are needed.
+    value: {get_attr: [scale_up_policy, alarm_url]}
+
+  scale_dn_url:
+    description: >
+      This URL is the webhook to scale down the autoscaling group.
+      You can invoke the scale-down operation by doing an HTTP POST to
+      this URL; no body nor extra headers are needed.
+    value: {get_attr: [scale_down_policy, alarm_url]}
+

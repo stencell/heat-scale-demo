@@ -107,8 +107,8 @@ resources:
       user_data: {get_resource: init}
 
   # Install, configure and enable the Heat configuration agent
-  config_agent:
-    type: collect-config-setup/install_config_agent_centos_yum.yaml
+  #config_agent:
+  #  type: collect-config-setup/install_config_agent_centos_yum.yaml
 
 
   # Collect the results from a set of resources
@@ -118,8 +118,8 @@ resources:
       parts:
       - config: {get_resource: rhn_register}
       - config: {get_resource: host_update}
-      - config: {get_attr: [config_agent, config]}
-        type: multipart
+      #- config: {get_attr: [config_agent, config]}
+      #  type: multipart
       - config: {get_resource: node_boot}
 
   # Create a network connection on the internal and apply security
@@ -154,7 +154,22 @@ resources:
         str_replace:
           params:
             $WC_NOTIFY: { get_attr: ['wait_handle', 'curl_cli'] }
-          template: {get_file: fragments/worker-node-boot.sh}
+          template: |
+            #!/bin/bash
+            set -eu
+            set -x
+            set -o pipefail
+            function notify_success() {
+              $WC_NOTIFY --data-binary  "{\"status\": \"SUCCESS\", \"reason\": \"$1\", \"data\": \"$1\"}"
+              exit 0
+            }
+            function notify_failure() {
+              $WC_NOTIFY --data-binary "{\"status\": \"FAILURE\", \"reason\": \"$1\", \"data\": \"$1\"}"
+              exit 1
+            }
+            # Required for SSH pipelining
+            sed -i "s/^.*requiretty/#Defaults requiretty/" /etc/sudoers
+            notify_success "worker node has been prepared for running HPC."
 
   # Register the host with RHN for access to software packages
   rhn_register:
@@ -166,14 +181,51 @@ resources:
             $RHN_USERNAME: {get_param: rhn_username}
             $RHN_PASSWORD: {get_param: rhn_password}
             $POOL_ID: {get_param: rhn_pool}
-          template: {get_file: fragments/rhn-register.sh}
+          template: |
+            #!/bin/bash
+            set -eu
+            set -x
+            set -o pipefail
+            if [ -n "$RHN_USERNAME" -a -n "$RHN_PASSWORD" ]; then
+              subscription-manager register \
+                         --username="$RHN_USERNAME" \
+                         --password="$RHN_PASSWORD"
+              if [ -n "$POOL_ID" ]; then
+                subscription-manager attach --pool $POOL_ID
+              else
+                subscription-manager attach --auto
+              fi
+              subscription-manager repos --disable="*"
+              subscription-manager repos \
+                         --enable="rhel-7-server-rpms"
+              rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+            fi
 
-  # Make sure the host software is current
   host_update:
     type: OS::Heat::SoftwareConfig
     properties:
       config:
-        get_file: fragments/host-update.sh
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -eux
+            set -o pipefail
+            function notify_success() {
+              $WC_NOTIFY --data-binary  "{\"status\": \"SUCCESS\", \"reason\": \"$1\", \"data\": \"$1\"}"
+              exit 0
+            }
+            function notify_failure() {
+              $WC_NOTIFY --data-binary "{\"status\": \"FAILURE\", \"reason\": \"$1\", \"data\": \"$1\"}"
+              exit 1
+            }
+            if [ -e /run/ostree-booted ]; then
+              atomic host upgrade || notify_failure "failed to run 'atomic host upgrade'"
+            else
+              yum install -y deltarpm || notify_failure "could not install deltarpm"
+              yum -y update || notify_failure "could not update RPMs"
+            fi
+          params:
+            $WC_NOTIFY: {get_attr: ['wait_handle', 'curl_cli'] }
 
 
 
@@ -189,3 +241,4 @@ resources:
   # a message which ends the wait and returns the value
   wait_handle:
     type: OS::Heat::WaitConditionHandle
+
